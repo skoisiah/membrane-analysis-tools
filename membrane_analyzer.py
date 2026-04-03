@@ -148,6 +148,108 @@ class MembraneAnalyzer:
         return np.array(apl_ts)
 
 
+    def calculate_multi_part_areas_voronoi(self, selections_dict):
+        """
+        Calculates the 2D Voronoi area for an arbitrary number of lipid parts simultaneously.
+        Uses dynamic Z-midplane calculations to sort molecules into upper/lower leaflets,
+        making it perfectly compatible with heterogeneous mixtures (like POPC + PFOA).
+        
+        Returns:
+        --------
+        Dictionary mapping each selection name to a 2D numpy array 
+        where Column 0 is Time (ns) and Column 1 is Area (A^2).
+        """
+        print(f"Calculating shared Voronoi areas for {len(selections_dict)} groups...")
+
+        # 1. Pre-select the raw atoms for the whole system (Faster than selecting every frame)
+        master_groups = {}
+        for name, sel_str in selections_dict.items():
+            ag = self.u.select_atoms(sel_str)
+            master_groups[name] = ag
+            print(f"  -> '{name}' found {len(ag)} total atoms.")
+
+        # Reference group used ONLY to find the membrane center
+        p_atoms = self.u.select_atoms("name P")
+
+        results = {name: [] for name in selections_dict.keys()}
+        times = []
+
+        # 2. Loop through the trajectory
+        for ts in self.u.trajectory:
+            box_dims = ts.dimensions[:2]
+            time_ns = ts.time / 1000.0
+            times.append(time_ns)
+
+            # --- DYNAMIC LEAFLET SPLITTING ---
+            # Find the exact Z-center of the membrane for this specific frame
+            z_mid = np.mean(p_atoms.positions[:, 2])
+
+            up_coords = []
+            up_labels = []
+            low_coords = []
+            low_labels = []
+
+            # 3. Sort the atoms into leaflets based on their Z-height
+            for name, ag in master_groups.items():
+                if len(ag) == 0:
+                    continue
+                
+                # Get the Z coordinates of all atoms in this group
+                z_coords = ag.positions[:, 2]
+                
+                # Create boolean masks (True if above z_mid, False if below)
+                up_mask = z_coords > z_mid
+                low_mask = ~up_mask
+                
+                # Extract the X,Y coordinates for the upper leaflet
+                if np.any(up_mask):
+                    up_coords.append(ag.positions[up_mask, :2])
+                    up_labels.extend([name] * np.sum(up_mask))
+                    
+                # Extract the X,Y coordinates for the lower leaflet
+                if np.any(low_mask):
+                    low_coords.append(ag.positions[low_mask, :2])
+                    low_labels.extend([name] * np.sum(low_mask))
+
+            # --- RUN VORONOI FOR UPPER LEAFLET ---
+            if up_coords:
+                up_combined = np.vstack(up_coords)
+                up_areas = self._compute_voronoi_areas(up_combined, box_dims)
+                up_labels = np.array(up_labels)
+            else:
+                up_areas = np.array([])
+                up_labels = np.array([])
+
+            # --- RUN VORONOI FOR LOWER LEAFLET ---
+            if low_coords:
+                low_combined = np.vstack(low_coords)
+                low_areas = self._compute_voronoi_areas(low_combined, box_dims)
+                low_labels = np.array(low_labels)
+            else:
+                low_areas = np.array([])
+                low_labels = np.array([])
+
+            # --- AGGREGATE & AVERAGE ---
+            for name in selections_dict.keys():
+                up_group_areas = up_areas[up_labels == name] if len(up_areas) > 0 else []
+                low_group_areas = low_areas[low_labels == name] if len(low_areas) > 0 else []
+                
+                all_group_areas = np.concatenate([up_group_areas, low_group_areas])
+                
+                if len(all_group_areas) > 0:
+                    results[name].append(np.nanmean(all_group_areas))
+                else:
+                    results[name].append(np.nan)
+
+        # 4. PACKAGE THE FINAL DICTIONARY
+        final_dict = {}
+        times_array = np.array(times)
+        for name, area_list in results.items():
+            final_dict[name] = np.column_stack((times_array, area_list))
+
+        return final_dict
+
+
     def calculate_area_per_part(self, selection_string):
         """
         Calculates the average Area Per Molecule (or part of a molecule) 
